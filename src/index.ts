@@ -9,7 +9,7 @@ dotenv.config();
 // Create an Express receiver for HTTP mode
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET!,
-  endpoints: '/slack/events',
+  // Remove custom endpoints to use default behavior
   processBeforeResponse: true,
 });
 
