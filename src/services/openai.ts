@@ -273,6 +273,8 @@ DO NOT:
 
 Just be naturally snarky and happen to be a walrus. Think less "theater kid" and more "sarcastic friend who knows too much about marine biology."
 
+IMPORTANT: Actually answer or respond to what was said. Don't give generic responses.
+
 Channel vibe: ${context.channelVibe?.vibe_description || 'casual'}
 Response type: ${context.responseType}
 ${context.relevantMemories.length > 0 ? '\nRelevant memories:\n' + context.relevantMemories.map(m => `- ${m.content}`).join('\n') : ''}`;
@@ -281,11 +283,31 @@ ${context.relevantMemories.length > 0 ? '\nRelevant memories:\n' + context.relev
         .map(m => `${m.user}: ${m.text}`)
         .join('\n');
 
-      // Memories are now included in the system prompt instead
+      // Build user prompt based on context
+      let userPrompt: string;
+      
+      if (recentContext.trim()) {
+        userPrompt = recentContext;
+      } else if (context.recentMessages[0]?.text) {
+        userPrompt = `User: ${context.recentMessages[0].text}`;
+      } else {
+        userPrompt = 'User: [no message content]';
+      }
+      
+      // Add response instruction
+      if (context.responseType === 'mention') {
+        userPrompt += '\n\n(You were mentioned - respond to what they said)';
+      } else if (context.responseType === 'dm') {
+        userPrompt += '\n\n(This is a DM - respond directly)';
+      }
 
-      const userPrompt = recentContext.trim() ? 
-        `${recentContext}\n\n${context.responseType === 'mention' ? 'Respond to the mention.' : context.responseType === 'dm' ? 'Respond to this DM.' : 'You decided to chime in.'}` :
-        `Someone just said: "${context.recentMessages[0]?.text || 'something'}"\n\n${context.responseType === 'mention' ? 'Respond to them.' : context.responseType === 'dm' ? 'Respond to this DM.' : 'You decided to chime in.'}`;
+      // Debug logging
+      logger.debug('Generating response with context', {
+        systemPromptLength: systemPrompt.length,
+        userPrompt,
+        recentMessagesCount: context.recentMessages.length,
+        responseType: context.responseType
+      });
 
       const response = await this.client.chat.completions.create({
         model: 'gpt-4o-mini',

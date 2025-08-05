@@ -39,6 +39,7 @@ export async function generateResponse(
     };
 
     // TODO: Get participant profiles from database
+    // For now, use user ID as display name
     const participants = recentMessages
       .map(m => m.user)
       .filter((user, index, self) => self.indexOf(user) === index)

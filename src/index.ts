@@ -85,7 +85,8 @@ app.message(async ({ message, say, client }) => {
     logger.info('Message received', { 
       channel: msg.channel,
       user: msg.user,
-      text: msg.text?.substring(0, 50)
+      text: msg.text,
+      fullMessage: JSON.stringify(msg)
     });
 
     // Build message context
