@@ -60,7 +60,7 @@ receiver.router.get('/health', (_req, res) => {
 });
 
 // Add error handling middleware
-receiver.router.use((err: any, req: any, res: any, next: any) => {
+receiver.router.use((err: any, req: any, res: any, _next: any) => {
   logger.error('Express error:', {
     error: err.message,
     stack: err.stack,
