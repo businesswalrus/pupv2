@@ -1,5 +1,29 @@
 # pup.ai - Context-Aware Slack Bot
 
+## Current Status (v0.1.0 - August 2025)
+
+### ✅ What's Working
+- **Slack Integration**: Bot successfully connects via HTTP webhooks
+- **Railway Deployment**: Running on `pupv2-production.up.railway.app`
+- **Event Handling**: Receives all messages, DMs, and mentions
+- **Slash Commands**: `/pup` command structure in place
+- **Health Monitoring**: Health check endpoint at `/health`
+- **Environment**: All required variables properly configured
+
+### 🚧 Not Yet Implemented
+- AI message processing pipeline
+- Memory formation and storage
+- Contextual response generation
+- Redis message buffering
+- Full database schema
+- Cost tracking
+
+### Deployment Details
+- **Platform**: Railway with automatic GitHub deployments
+- **URL**: `https://pupv2-production.up.railway.app`
+- **Port**: 8080 (Railway default)
+- **Mode**: HTTP webhooks (not Socket Mode)
+
 ## Project Overview
 
 pup.ai is an intelligent Slack bot designed for intimate friend groups that monitors conversations, builds organic memories, and responds as a witty observer. Unlike traditional bots that only respond to direct commands, pup.ai actively processes every message to understand context, track relationships, and contribute meaningful responses when appropriate.
