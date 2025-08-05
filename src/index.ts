@@ -8,18 +8,9 @@ if (process.env.NODE_ENV !== 'production') {
   dotenv.config();
 }
 
-// Debug: Log all env vars starting with SLACK or NODE
-logger.info('Environment variables debug:', {
-  NODE_ENV: process.env.NODE_ENV,
-  envKeys: Object.keys(process.env).filter(key => 
-    key.startsWith('SLACK') || key.startsWith('NODE') || key.startsWith('OPENAI')
-  ),
-});
-
 // Validate required environment variables
 if (!process.env.SLACK_SIGNING_SECRET) {
   logger.error('SLACK_SIGNING_SECRET is not set!');
-  logger.error('Available env vars:', Object.keys(process.env).sort());
   process.exit(1);
 }
 
@@ -28,12 +19,6 @@ if (!process.env.SLACK_BOT_TOKEN) {
   process.exit(1);
 }
 
-// Log environment check
-logger.info('Environment check:', {
-  hasSigningSecret: !!process.env.SLACK_SIGNING_SECRET,
-  hasBotToken: !!process.env.SLACK_BOT_TOKEN,
-  signingSecretLength: process.env.SLACK_SIGNING_SECRET?.length,
-});
 
 // Create an Express receiver for HTTP mode
 const receiver = new ExpressReceiver({
@@ -70,25 +55,6 @@ receiver.router.use((err: any, req: any, res: any, _next: any) => {
   res.status(500).send('Internal Server Error');
 });
 
-// Add logging middleware to debug
-receiver.router.use((req, _res, next) => {
-  try {
-    logger.info('Incoming request', {
-      method: req.method,
-      path: req.path,
-      headers: {
-        'content-type': req.headers['content-type'],
-        'x-slack-signature': req.headers['x-slack-signature'] ? 'present' : 'missing',
-        'x-slack-request-timestamp': req.headers['x-slack-request-timestamp'],
-      },
-      bodyType: req.body?.type,
-    });
-    next();
-  } catch (error) {
-    logger.error('Logging middleware error:', error);
-    next();
-  }
-});
 
 // Add root endpoint for verification
 receiver.router.get('/', (_req, res) => {
@@ -106,7 +72,7 @@ app.message(async ({ message, say }) => {
 
     // Only respond to direct mentions for now
     if ((message as any).text?.includes(`<@${(await app.client.auth.test()).user_id}>`)) {
-      await say("hey! i'm still learning how to be witty. check back soon 🤖");
+      await say("hey! i'm still learning how to be witty. check back soon");
     }
   } catch (error) {
     logger.error('Error handling message', error);
