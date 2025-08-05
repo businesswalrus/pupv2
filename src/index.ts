@@ -6,6 +6,13 @@ import { logger } from './utils/logger';
 // Load environment variables
 dotenv.config();
 
+// Log environment check
+console.log('Environment check:', {
+  hasSigningSecret: !!process.env.SLACK_SIGNING_SECRET,
+  hasBotToken: !!process.env.SLACK_BOT_TOKEN,
+  signingSecretLength: process.env.SLACK_SIGNING_SECRET?.length,
+});
+
 // Create an Express receiver for HTTP mode
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET!,
@@ -28,6 +35,21 @@ receiver.router.get('/health', (_req, res) => {
     version: '1.0.0',
     mode: 'http',
   });
+});
+
+// Add logging middleware to debug
+receiver.router.use((req, _res, next) => {
+  logger.info('Incoming request', {
+    method: req.method,
+    path: req.path,
+    headers: {
+      'content-type': req.headers['content-type'],
+      'x-slack-signature': req.headers['x-slack-signature'] ? 'present' : 'missing',
+      'x-slack-request-timestamp': req.headers['x-slack-request-timestamp'],
+    },
+    bodyType: req.body?.type,
+  });
+  next();
 });
 
 // Add root endpoint for verification
