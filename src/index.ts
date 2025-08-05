@@ -2,6 +2,8 @@ import { App, ExpressReceiver } from '@slack/bolt';
 import dotenv from 'dotenv';
 import { initializeDatabase } from './database/connection';
 import { logger } from './utils/logger';
+import { processMessage, MessageContext } from './pipeline';
+import { getOpenAIService } from './services/openai';
 
 // Load environment variables - only in development
 if (process.env.NODE_ENV !== 'production') {
@@ -61,18 +63,61 @@ receiver.router.get('/', (_req, res) => {
   res.send('pup.ai is running! 🐕');
 });
 
-// Message handler - log all messages for now
-app.message(async ({ message, say }) => {
+// Store bot user ID for mention detection
+let botUserId: string | null = null;
+
+// Message handler with AI processing
+app.message(async ({ message, say, client }) => {
   try {
+    const msg = message as any;
+    
+    // Skip messages from bots (including ourselves)
+    if (msg.bot_id || msg.subtype === 'bot_message') {
+      return;
+    }
+
+    // Get bot user ID if not cached
+    if (!botUserId) {
+      const authResult = await client.auth.test();
+      botUserId = authResult.user_id || null;
+    }
+
     logger.info('Message received', { 
-      channel: (message as any).channel,
-      user: (message as any).user,
-      text: (message as any).text
+      channel: msg.channel,
+      user: msg.user,
+      text: msg.text?.substring(0, 50)
     });
 
-    // Only respond to direct mentions for now
-    if ((message as any).text?.includes(`<@${(await app.client.auth.test()).user_id}>`)) {
-      await say("hey! i'm still learning how to be witty. check back soon");
+    // Build message context
+    const messageContext: MessageContext = {
+      text: msg.text || '',
+      user: msg.user,
+      channel: msg.channel,
+      timestamp: msg.ts,
+      thread_ts: msg.thread_ts,
+      recentMessages: [] // TODO: Get from Redis buffer
+    };
+
+    // Process message through AI pipeline
+    const result = await processMessage({
+      message: messageContext,
+      botUserId: botUserId!,
+      recentMessages: [] // TODO: Get from Redis buffer
+    });
+
+    // Send response if generated
+    if (result.response) {
+      await say({
+        text: result.response,
+        thread_ts: msg.thread_ts // Respond in thread if message was in thread
+      });
+    }
+
+    // Log usage stats periodically
+    const openai = getOpenAIService();
+    const stats = openai.getUsageStats();
+    if (stats.totalTokensUsed > 0 && Math.random() < 0.1) { // Log 10% of the time
+      logger.info('OpenAI usage stats', stats);
     }
   } catch (error) {
     logger.error('Error handling message', error);
@@ -87,8 +132,10 @@ app.command('/pup', async ({ command, ack, respond }) => {
   
   switch (subcommand) {
     case 'status':
+      const openai = getOpenAIService();
+      const stats = openai.getUsageStats();
       await respond({
-        text: "🟢 pup.ai is online and learning!",
+        text: `🟢 pup.ai is online and learning!\n\n*OpenAI Usage:*\n• Tokens: ${stats.totalTokensUsed.toLocaleString()}\n• Cost: ${stats.costInUSD}`,
         response_type: 'ephemeral'
       });
       break;
