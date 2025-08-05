@@ -3,12 +3,23 @@ import dotenv from 'dotenv';
 import { initializeDatabase } from './database/connection';
 import { logger } from './utils/logger';
 
-// Load environment variables
-dotenv.config();
+// Load environment variables - only in development
+if (process.env.NODE_ENV !== 'production') {
+  dotenv.config();
+}
+
+// Debug: Log all env vars starting with SLACK or NODE
+logger.info('Environment variables debug:', {
+  NODE_ENV: process.env.NODE_ENV,
+  envKeys: Object.keys(process.env).filter(key => 
+    key.startsWith('SLACK') || key.startsWith('NODE') || key.startsWith('OPENAI')
+  ),
+});
 
 // Validate required environment variables
 if (!process.env.SLACK_SIGNING_SECRET) {
   logger.error('SLACK_SIGNING_SECRET is not set!');
+  logger.error('Available env vars:', Object.keys(process.env).sort());
   process.exit(1);
 }
 
