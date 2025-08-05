@@ -121,8 +121,9 @@ async function start() {
     const PORT = process.env.PORT || 3000;
     await app.start(PORT);
     
+    logger.info('='.repeat(50));
     logger.info(`⚡️ pup.ai is running on port ${PORT}!`);
-    logger.info(`Webhook URL: https://your-app.up.railway.app/slack/events`);
+    logger.info('='.repeat(50));
   } catch (error) {
     logger.error('Failed to start app', error);
     process.exit(1);
