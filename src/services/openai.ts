@@ -283,10 +283,9 @@ ${context.relevantMemories.length > 0 ? '\nRelevant memories:\n' + context.relev
 
       // Memories are now included in the system prompt instead
 
-      const userPrompt = `Current conversation:
-${recentContext}
-
-${context.responseType === 'mention' ? 'You were just mentioned!' : context.responseType === 'dm' ? 'This is a direct message to you.' : 'You decided to chime in.'}`;
+      const userPrompt = recentContext.trim() ? 
+        `${recentContext}\n\n${context.responseType === 'mention' ? 'Respond to the mention.' : context.responseType === 'dm' ? 'Respond to this DM.' : 'You decided to chime in.'}` :
+        `Someone just said: "${context.recentMessages[0]?.text || 'something'}"\n\n${context.responseType === 'mention' ? 'Respond to them.' : context.responseType === 'dm' ? 'Respond to this DM.' : 'You decided to chime in.'}`;
 
       const response = await this.client.chat.completions.create({
         model: 'gpt-4o-mini',

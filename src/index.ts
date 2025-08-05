@@ -99,10 +99,11 @@ app.message(async ({ message, say, client }) => {
     };
 
     // Process message through AI pipeline
+    // Include the current message in recentMessages so the bot knows what was said
     const result = await processMessage({
       message: messageContext,
       botUserId: botUserId!,
-      recentMessages: [] // TODO: Get from Redis buffer
+      recentMessages: [messageContext] // Include current message until Redis is implemented
     });
 
     // Send response if generated
