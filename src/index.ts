@@ -6,8 +6,19 @@ import { logger } from './utils/logger';
 // Load environment variables
 dotenv.config();
 
+// Validate required environment variables
+if (!process.env.SLACK_SIGNING_SECRET) {
+  logger.error('SLACK_SIGNING_SECRET is not set!');
+  process.exit(1);
+}
+
+if (!process.env.SLACK_BOT_TOKEN) {
+  logger.error('SLACK_BOT_TOKEN is not set!');
+  process.exit(1);
+}
+
 // Log environment check
-console.log('Environment check:', {
+logger.info('Environment check:', {
   hasSigningSecret: !!process.env.SLACK_SIGNING_SECRET,
   hasBotToken: !!process.env.SLACK_BOT_TOKEN,
   signingSecretLength: process.env.SLACK_SIGNING_SECRET?.length,
@@ -15,9 +26,9 @@ console.log('Environment check:', {
 
 // Create an Express receiver for HTTP mode
 const receiver = new ExpressReceiver({
-  signingSecret: process.env.SLACK_SIGNING_SECRET!,
-  // Remove custom endpoints to use default behavior
+  signingSecret: process.env.SLACK_SIGNING_SECRET,
   processBeforeResponse: true,
+  logLevel: process.env.LOG_LEVEL as any || 'debug',
 });
 
 // Initialize Slack app with HTTP receiver
@@ -37,19 +48,35 @@ receiver.router.get('/health', (_req, res) => {
   });
 });
 
+// Add error handling middleware
+receiver.router.use((err: any, req: any, res: any, next: any) => {
+  logger.error('Express error:', {
+    error: err.message,
+    stack: err.stack,
+    path: req.path,
+    method: req.method,
+  });
+  res.status(500).send('Internal Server Error');
+});
+
 // Add logging middleware to debug
 receiver.router.use((req, _res, next) => {
-  logger.info('Incoming request', {
-    method: req.method,
-    path: req.path,
-    headers: {
-      'content-type': req.headers['content-type'],
-      'x-slack-signature': req.headers['x-slack-signature'] ? 'present' : 'missing',
-      'x-slack-request-timestamp': req.headers['x-slack-request-timestamp'],
-    },
-    bodyType: req.body?.type,
-  });
-  next();
+  try {
+    logger.info('Incoming request', {
+      method: req.method,
+      path: req.path,
+      headers: {
+        'content-type': req.headers['content-type'],
+        'x-slack-signature': req.headers['x-slack-signature'] ? 'present' : 'missing',
+        'x-slack-request-timestamp': req.headers['x-slack-request-timestamp'],
+      },
+      bodyType: req.body?.type,
+    });
+    next();
+  } catch (error) {
+    logger.error('Logging middleware error:', error);
+    next();
+  }
 });
 
 // Add root endpoint for verification
