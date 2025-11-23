@@ -26,17 +26,13 @@ export async function initializeDatabase(): Promise<void> {
     });
 
     // Load sqlite-vec extension for vector operations
-    await new Promise<void>((resolve, reject) => {
-      sqliteVec.load(db, (err) => {
-        if (err) {
-          logger.error('Failed to load sqlite-vec extension', err);
-          reject(err);
-        } else {
-          logger.info('sqlite-vec extension loaded successfully');
-          resolve();
-        }
-      });
-    });
+    try {
+      sqliteVec.load(db);
+      logger.info('sqlite-vec extension loaded successfully');
+    } catch (err) {
+      logger.error('Failed to load sqlite-vec extension', err);
+      throw err;
+    }
 
     // Enable foreign keys and other pragmas
     await runQuery('PRAGMA foreign_keys = ON');

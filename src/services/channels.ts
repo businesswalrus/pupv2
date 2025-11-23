@@ -2,7 +2,7 @@ import { runQuery, getQuery } from '../database/connection';
 import { logger } from '../utils/logger';
 import { v4 as uuidv4 } from 'uuid';
 import { getRedisService } from './redis';
-import { getOpenAIService } from './openai';
+import OpenAI from 'openai';
 
 export interface ChannelVibe {
   id: string;
@@ -127,7 +127,7 @@ export async function analyzeAndUpdateChannelVibe(
       return;
     }
 
-    const openai = getOpenAIService();
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
     // Build prompt for AI to analyze channel vibe
     const messageTexts = recentMessages.slice(-50).map(m => m.text).join('\n---\n');
@@ -142,7 +142,7 @@ Return JSON with:
 
 Be concise and accurate.`;
 
-    const response = await openai.client.chat.completions.create({
+    const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
         { role: 'system', content: systemPrompt },
@@ -153,7 +153,7 @@ Be concise and accurate.`;
       max_tokens: 300
     });
 
-    const analysis = JSON.parse(response.choices[0].message.content || '{}');
+    const analysis = JSON.parse(response.choices[0]?.message?.content || '{}');
 
     // Update database
     await runQuery(`
