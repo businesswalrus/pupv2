@@ -1,6 +1,8 @@
 import { getOpenAIService, MessageContext, ResponseContext } from '../services/openai';
 import { searchMemories } from './memory';
 import { logger } from '../utils/logger';
+import { getChannelVibe } from '../services/channels';
+import { ensureUserExists } from '../services/users';
 
 interface GenerateResponseOptions {
   message: MessageContext;
@@ -29,24 +31,38 @@ export async function generateResponse(
     });
 
     // Search for relevant memories based on message content
-    const relevantMemories = await searchMemories(message.text, 3);
-    
-    // TODO: Get channel vibe from database
+    const relevantMemories = await searchMemories(message.text, 3, message.channel);
+
+    // Get channel vibe from database (with caching)
+    const channelVibeData = await getChannelVibe(message.channel);
     const channelVibe = {
-      vibe_description: 'casual and friendly',
-      formality_level: 0.3,
-      humor_tolerance: 0.8
+      vibe_description: channelVibeData.vibe_description,
+      formality_level: channelVibeData.formality_level,
+      humor_tolerance: channelVibeData.humor_tolerance
     };
 
-    // TODO: Get participant profiles from database
-    // For now, use user ID as display name
-    const participants = recentMessages
+    // Get participant profiles from database
+    const uniqueUsers = recentMessages
       .map(m => m.user)
-      .filter((user, index, self) => self.indexOf(user) === index)
-      .map(user => ({
-        display_name: user,
-        personality_traits: {}
-      }));
+      .filter((user, index, self) => self.indexOf(user) === index);
+
+    const participants = await Promise.all(
+      uniqueUsers.map(async (userId) => {
+        try {
+          const profile = await ensureUserExists(userId);
+          return {
+            display_name: profile.display_name,
+            personality_traits: profile.personality_traits
+          };
+        } catch (error) {
+          logger.warn('Failed to get user profile', { userId, error });
+          return {
+            display_name: userId,
+            personality_traits: {}
+          };
+        }
+      })
+    );
 
     const context: ResponseContext = {
       recentMessages,

@@ -1,6 +1,8 @@
 import OpenAI from 'openai';
 import { logger } from '../utils/logger';
 import { z } from 'zod';
+import { runQuery } from '../database/connection';
+import { v4 as uuidv4 } from 'uuid';
 
 // Schema definitions for OpenAI responses
 export const IngestionResultSchema = z.object({
@@ -61,6 +63,9 @@ export class OpenAIService {
   private client: OpenAI;
   private totalTokensUsed: number = 0;
   private totalCost: number = 0;
+  private consecutiveFailures: number = 0;
+  private circuitBreakerOpen: boolean = false;
+  private circuitBreakerResetTime?: Date;
 
   constructor(apiKey: string) {
     if (!apiKey) {
@@ -68,6 +73,91 @@ export class OpenAIService {
     }
     this.client = new OpenAI({ apiKey });
     logger.info('OpenAI service initialized');
+  }
+
+  /**
+   * Retry wrapper with exponential backoff for API calls
+   */
+  private async retryWithBackoff<T>(
+    operation: () => Promise<T>,
+    operationName: string,
+    maxRetries: number = 3
+  ): Promise<T> {
+    // Check circuit breaker
+    if (this.circuitBreakerOpen) {
+      if (this.circuitBreakerResetTime && new Date() > this.circuitBreakerResetTime) {
+        logger.info('Circuit breaker reset attempt', { operationName });
+        this.circuitBreakerOpen = false;
+        this.consecutiveFailures = 0;
+      } else {
+        const error = new Error('Circuit breaker is open - too many consecutive failures');
+        logger.error('Circuit breaker preventing API call', { operationName });
+        throw error;
+      }
+    }
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const result = await operation();
+
+        // Success - reset failure counter
+        if (this.consecutiveFailures > 0) {
+          logger.info('OpenAI call succeeded after previous failures', {
+            operationName,
+            previousFailures: this.consecutiveFailures
+          });
+        }
+        this.consecutiveFailures = 0;
+
+        return result;
+      } catch (error: any) {
+        const isLastAttempt = attempt === maxRetries;
+        const isRateLimitError = error.status === 429;
+        const isServerError = error.status >= 500;
+        const shouldRetry = (isRateLimitError || isServerError) && !isLastAttempt;
+
+        if (shouldRetry) {
+          // Exponential backoff: 1s, 2s, 4s
+          const backoffMs = Math.min(1000 * Math.pow(2, attempt), 10000);
+          logger.warn('OpenAI API call failed, retrying', {
+            operationName,
+            attempt: attempt + 1,
+            maxRetries,
+            backoffMs,
+            error: error.message,
+            status: error.status
+          });
+
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
+          continue;
+        }
+
+        // Final failure or non-retryable error
+        this.consecutiveFailures++;
+
+        logger.error('OpenAI API call failed', {
+          operationName,
+          attempt: attempt + 1,
+          consecutiveFailures: this.consecutiveFailures,
+          error: error.message,
+          status: error.status
+        });
+
+        // Open circuit breaker after 5 consecutive failures
+        if (this.consecutiveFailures >= 5) {
+          this.circuitBreakerOpen = true;
+          this.circuitBreakerResetTime = new Date(Date.now() + 60000); // Reset after 1 minute
+          logger.error('Circuit breaker opened after consecutive failures', {
+            consecutiveFailures: this.consecutiveFailures,
+            resetTime: this.circuitBreakerResetTime
+          });
+        }
+
+        throw error;
+      }
+    }
+
+    throw new Error('Retry logic error - should not reach here');
   }
 
   async ingestMessage(context: MessageContext): Promise<IngestionResult> {
@@ -119,16 +209,19 @@ Respond with JSON matching this structure:
   }
 }`;
 
-      const response = await this.client.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
-        ],
-        temperature: 0.7,
-        max_tokens: 200,
-        response_format: { type: 'json_object' }
-      });
+      const response = await this.retryWithBackoff(
+        () => this.client.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt }
+          ],
+          temperature: 0.7,
+          max_tokens: 200,
+          response_format: { type: 'json_object' }
+        }),
+        'ingestMessage'
+      );
 
       const result = response.choices[0]?.message?.content;
       if (!result) {
@@ -142,11 +235,21 @@ Respond with JSON matching this structure:
       if (response.usage?.total_tokens) {
         this.totalTokensUsed += response.usage.total_tokens;
         this.totalCost += this.calculateCost(response.usage.total_tokens, 'gpt-4o-mini');
+
+        // Record to database
+        await this.recordInteraction(
+          'ingestion',
+          response.usage.total_tokens,
+          'gpt-4o-mini',
+          true,
+          context.channel,
+          context.user
+        );
       }
 
-      logger.debug('Message ingestion result', { 
+      logger.debug('Message ingestion result', {
         messageText: context.text.substring(0, 50),
-        result: validated 
+        result: validated
       });
 
       return validated;
@@ -234,12 +337,22 @@ Respond with JSON:
       if (response.usage?.total_tokens) {
         this.totalTokensUsed += response.usage.total_tokens;
         this.totalCost += this.calculateCost(response.usage.total_tokens, 'gpt-4o-mini');
+
+        // Record to database
+        await this.recordInteraction(
+          'memory_formation',
+          response.usage.total_tokens,
+          'gpt-4o-mini',
+          true,
+          context.channel,
+          context.user
+        );
       }
 
-      logger.info('Memory formed', { 
+      logger.info('Memory formed', {
         type: memory.type,
         significance: memory.significance,
-        content: memory.content.substring(0, 50) 
+        content: memory.content.substring(0, 50)
       });
 
       return memory;
@@ -322,16 +435,27 @@ ${context.relevantMemories.length > 0 ? '\nRelevant memories:\n' + context.relev
       });
 
       const result = response.choices[0]?.message?.content;
-      
+
       // Track usage
       if (response.usage?.total_tokens) {
         this.totalTokensUsed += response.usage.total_tokens;
         this.totalCost += this.calculateCost(response.usage.total_tokens, 'gpt-4o-mini');
+
+        // Record to database - use first recent message for channel/user context
+        const firstMessage = context.recentMessages[context.recentMessages.length - 1];
+        await this.recordInteraction(
+          'response_generation',
+          response.usage.total_tokens,
+          'gpt-4o-mini',
+          true,
+          firstMessage?.channel,
+          firstMessage?.user
+        );
       }
 
-      logger.info('Response generated', { 
+      logger.info('Response generated', {
         type: context.responseType,
-        responseLength: result?.length || 0 
+        responseLength: result?.length || 0
       });
 
       return result || null;
@@ -355,6 +479,46 @@ ${context.relevantMemories.length > 0 ? '\nRelevant memories:\n' + context.relev
     }
   }
 
+  /**
+   * Record an API interaction to the database for cost tracking
+   */
+  private async recordInteraction(
+    operationType: string,
+    tokensUsed: number,
+    modelUsed: string,
+    success: boolean,
+    channelId?: string,
+    userId?: string,
+    errorMessage?: string
+  ): Promise<void> {
+    try {
+      const cost = this.calculateCost(tokensUsed, modelUsed);
+
+      await runQuery(`
+        INSERT INTO interactions (
+          id, timestamp, operation_type, tokens_used,
+          cost_usd, model_used, success, error_message,
+          channel_id, user_id
+        ) VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        uuidv4(),
+        operationType,
+        tokensUsed,
+        cost,
+        modelUsed,
+        success ? 1 : 0,
+        errorMessage || null,
+        channelId || null,
+        userId || null
+      ]);
+
+      logger.debug('Interaction recorded', { operationType, tokensUsed, cost, success });
+    } catch (error) {
+      logger.warn('Failed to record interaction to database', error);
+      // Don't throw - this is a non-critical failure
+    }
+  }
+
   private calculateCost(tokens: number, model: string): number {
     // Pricing as of 2024
     const pricing: Record<string, { input: number; output: number }> = {
@@ -366,11 +530,11 @@ ${context.relevantMemories.length > 0 ? '\nRelevant memories:\n' + context.relev
     if (!modelPricing) {
       return 0;
     }
-    
+
     // Rough estimate: assume 60/40 split for input/output tokens
     const inputTokens = tokens * 0.6;
     const outputTokens = tokens * 0.4;
-    
+
     return (inputTokens * modelPricing.input + outputTokens * modelPricing.output) / 1000;
   }
 
