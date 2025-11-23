@@ -58,13 +58,8 @@ export async function formMemory(
           JSON.stringify(memory.participants)
         ]);
 
-        // Insert embedding into vector search table if available
-        if (memory.embedding && memory.embedding.length === 1536) {
-          await runQuery(`
-            INSERT INTO vec_memories (memory_id, embedding)
-            VALUES (?, ?)
-          `, [memoryId, JSON.stringify(memory.embedding)]);
-        }
+        // Note: Vector search table not available yet
+        // Embeddings are stored in the embedding BLOB column for future use
 
         logger.info('Memory saved to database', {
           id: memoryId,
@@ -94,39 +89,32 @@ export async function searchMemories(
   try {
     logger.debug('Memory search requested', { query, limit, channelId });
 
-    // Generate embedding for the search query
-    const openai = getOpenAIService();
-    const queryEmbedding = await openai.generateEmbedding(query);
-
-    if (!queryEmbedding || queryEmbedding.length !== 1536) {
-      logger.warn('Failed to generate query embedding for memory search');
-      return [];
-    }
-
-    // Perform vector similarity search using sqlite-vec
-    // This finds the most similar memories based on cosine similarity
+    // Simplified memory search: fetch recent significant memories
+    // TODO: Implement proper vector similarity search when sqlite-vec is configured
     let searchQuery = `
       SELECT
-        m.id, m.content, m.type, m.channel_id, m.user_id,
-        m.metadata, m.significance_score, m.created_at,
-        m.searchable_text, m.tags, m.context, m.participants,
-        vec.distance
-      FROM vec_memories vec
-      JOIN memories m ON vec.memory_id = m.id
-      WHERE vec.embedding MATCH ?
-        AND (m.expires_at IS NULL OR m.expires_at > datetime('now'))
+        id, content, type, channel_id, user_id,
+        metadata, significance_score, created_at,
+        searchable_text, tags, context, participants
+      FROM memories
+      WHERE (expires_at IS NULL OR expires_at > datetime('now'))
+        AND (
+          searchable_text LIKE ?
+          OR content LIKE ?
+        )
     `;
 
-    const params: any[] = [JSON.stringify(queryEmbedding)];
+    const searchPattern = `%${query}%`;
+    const params: any[] = [searchPattern, searchPattern];
 
     // Optionally filter by channel
     if (channelId) {
-      searchQuery += ' AND m.channel_id = ?';
+      searchQuery += ' AND channel_id = ?';
       params.push(channelId);
     }
 
     searchQuery += `
-      ORDER BY vec.distance ASC
+      ORDER BY significance_score DESC, created_at DESC
       LIMIT ?
     `;
     params.push(limit);
@@ -148,7 +136,7 @@ export async function searchMemories(
       content: row.content,
       context: row.context,
       participants: JSON.parse(row.participants || '[]'),
-      embedding: undefined, // Don't load full embedding for response
+      embedding: undefined,
       tags: JSON.parse(row.tags || '[]'),
       searchableText: row.searchable_text,
       type: row.type,

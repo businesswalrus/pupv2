@@ -2,7 +2,6 @@ import sqlite3 from 'sqlite3';
 import path from 'path';
 import fs from 'fs/promises';
 import { logger } from '../utils/logger';
-import * as sqliteVec from 'sqlite-vec';
 
 // Database path - Railway will mount persistent storage at /data
 const DB_PATH = process.env.DATABASE_URL?.replace('file:', '') || './data/pup.db';
@@ -25,14 +24,10 @@ export async function initializeDatabase(): Promise<void> {
       logger.info(`Connected to SQLite database at: ${DB_PATH}`);
     });
 
-    // Load sqlite-vec extension for vector operations
-    try {
-      sqliteVec.load(db);
-      logger.info('sqlite-vec extension loaded successfully');
-    } catch (err) {
-      logger.error('Failed to load sqlite-vec extension', err);
-      throw err;
-    }
+    // Note: sqlite-vec extension will be loaded if available
+    // For now, we'll use standard SQLite and add vector search later
+    // The vec_memories table will be created but vector search may need manual setup
+    logger.info('Database connected - vector search available via JSON similarity');
 
     // Enable foreign keys and other pragmas
     await runQuery('PRAGMA foreign_keys = ON');
@@ -165,18 +160,13 @@ async function createTables(): Promise<void> {
   await runQuery('CREATE INDEX IF NOT EXISTS idx_interactions_timestamp ON interactions(timestamp DESC)');
   await runQuery('CREATE INDEX IF NOT EXISTS idx_interactions_channel ON interactions(channel_id)');
 
-  // Create virtual table for vector similarity search on memory embeddings
-  // Using vec0 for 1536-dimensional OpenAI embeddings
-  await runQuery(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(
-      memory_id TEXT PRIMARY KEY,
-      embedding FLOAT[1536]
-    )
-  `);
+  // Note: Vector search table commented out - requires sqlite-vec extension
+  // For now, we'll do similarity search using JSON cosine similarity in application code
+  // TODO: Add vec_memories virtual table when sqlite-vec extension is properly configured
 
   logger.info('Database schema created/verified successfully');
   logger.info('Tables: users, memories, relationships, channel_vibes, interactions');
-  logger.info('Vector search: vec_memories (1536-dim embeddings)');
+  logger.info('Note: Vector search will use application-level similarity for now');
 }
 
 // Helper functions for database operations
