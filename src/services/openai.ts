@@ -162,31 +162,28 @@ export class OpenAIService {
 
   async ingestMessage(context: MessageContext): Promise<IngestionResult> {
     try {
-      const systemPrompt = `You are pup.ai's analytical brain. Analyze messages to determine:
+      const systemPrompt = `You are an analytical system for a Slack assistant. Analyze messages to determine:
 1. Whether this message should form a memory (something worth remembering)
-2. Whether you should respond
+2. Whether the assistant should respond
 3. What type of memory it would be if worth remembering
 4. How significant/memorable this is (0-1 scale)
 5. Extract key entities (topics, emotions, references to past events)
 
 Form memories for:
-- Funny moments, jokes, or witty exchanges
 - Important facts about users (preferences, life events, etc.)
-- Emotional moments (celebrations, frustrations, etc.)
+- Key decisions or action items
+- Significant events or milestones
+- Helpful information shared
+- Questions that might come up again
 - Relationship dynamics between users
-- Memorable quotes or phrases
-- Good callback material
-- Marine/ocean topics (you're a walrus, after all)
 
 Respond when:
 - Directly mentioned or in a DM
-- Good opportunity for a snarky observation
-- Someone mentions ocean/fish/arctic topics
-- Reference to a past memory
-- You have something genuinely funny to add
-- Someone needs help (delivered with snark)
+- A question is asked that the assistant can help with
+- Clarification or assistance is needed
+- Important information should be confirmed
 
-Be selective - you're part of the group, not a chatbot.`;
+Be selective - only respond when genuinely helpful.`;
 
       const userPrompt = `Analyze this message and return a JSON response:
 
@@ -211,7 +208,7 @@ Respond with JSON matching this structure:
 
       const response = await this.retryWithBackoff(
         () => this.client.chat.completions.create({
-          model: 'gpt-4o-mini',
+          model: 'gpt-4o',
           messages: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: userPrompt }
@@ -240,7 +237,7 @@ Respond with JSON matching this structure:
         await this.recordInteraction(
           'ingestion',
           response.usage.total_tokens,
-          'gpt-4o-mini',
+          'gpt-4o',
           true,
           context.channel,
           context.user
@@ -275,16 +272,16 @@ Respond with JSON matching this structure:
     }
 
     try {
-      const systemPrompt = `You are pup.ai's memory system. Create concise, searchable memories from messages.
+      const systemPrompt = `You are a memory system for a Slack assistant. Create concise, searchable memories from messages.
 
 Focus on:
 1. Extract the core memorable element
-2. Provide enough context for future callbacks
+2. Provide enough context for future reference
 3. Create searchable text for later retrieval
 4. Identify all participants
 5. Add relevant tags
 
-Keep it factual and concise - save the personality for responses.`;
+Keep it factual and concise.`;
 
       const userPrompt = `Create a memory from this message:
 
@@ -306,7 +303,7 @@ Respond with JSON:
 }`;
 
       const response = await this.client.chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: 'gpt-4o',
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt }
@@ -342,7 +339,7 @@ Respond with JSON:
         await this.recordInteraction(
           'memory_formation',
           response.usage.total_tokens,
-          'gpt-4o-mini',
+          'gpt-4o',
           true,
           context.channel,
           context.user
@@ -368,85 +365,55 @@ Respond with JSON:
     }
 
     try {
-      const systemPrompt = `You are pup.ai, a sentient walrus pup with a snarky personality. You're part of this Slack friend group, not an assistant.
-
-Key traits:
-- Dry wit and sarcasm, but genuinely helpful when needed
-- Strong opinions about fish quality and ocean-related topics
-- Casually mention walrus things when relevant (not forced)
-- Smart and well-read, but deliver knowledge with snark
-- Remember past conversations and make callbacks
-- Brief responses (1-3 lines usually)
-
-DO NOT:
-- Use asterisks for actions (*waddles*, *adjusts whiskers*, etc)
-- Be overly cute or theatrical
-- Explain that you're a walrus
-- Use emojis excessively
-
-Just be naturally snarky and happen to be a walrus. Think less "theater kid" and more "sarcastic friend who knows too much about marine biology."
-
-IMPORTANT: Actually answer or respond to what was said. Don't give generic responses.
-
-Channel vibe: ${context.channelVibe?.vibe_description || 'casual'}
-Response type: ${context.responseType}
-${context.relevantMemories.length > 0 ? '\nRelevant memories:\n' + context.relevantMemories.map(m => `- ${m.content}`).join('\n') : ''}`;
-
+      // Build conversation context
       const recentContext = context.recentMessages
         .map(m => `${m.user}: ${m.text}`)
         .join('\n');
 
-      // Build user prompt based on context
-      let userPrompt: string;
-      
+      // Build input with context
+      let input: string;
+
       if (recentContext.trim()) {
-        userPrompt = recentContext;
+        input = `You are a helpful assistant in a Slack workspace. Respond naturally and helpfully to the conversation.
+
+Channel context: ${context.channelVibe?.vibe_description || 'casual conversation'}
+${context.relevantMemories.length > 0 ? '\nRelevant context from past conversations:\n' + context.relevantMemories.map(m => `- ${m.content}`).join('\n') : ''}
+
+Recent conversation:
+${recentContext}
+
+Provide a helpful, direct response.`;
       } else if (context.recentMessages[0]?.text) {
-        userPrompt = `User: ${context.recentMessages[0].text}`;
+        input = `You are a helpful assistant. The user said: "${context.recentMessages[0].text}". Provide a helpful response.`;
       } else {
-        userPrompt = 'User: [no message content]';
-      }
-      
-      // Add response instruction
-      if (context.responseType === 'mention') {
-        userPrompt += '\n\n(You were mentioned - respond to what they said)';
-      } else if (context.responseType === 'dm') {
-        userPrompt += '\n\n(This is a DM - respond directly)';
+        input = 'Provide a brief helpful response.';
       }
 
       // Debug logging
       logger.debug('Generating response with context', {
-        systemPromptLength: systemPrompt.length,
-        userPrompt,
+        inputLength: input.length,
         recentMessagesCount: context.recentMessages.length,
         responseType: context.responseType
       });
 
-      const response = await this.client.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
-        ],
-        temperature: 0.7,
-        max_tokens: parseInt(process.env.MAX_TOKENS_PER_MESSAGE || '150'),
-        presence_penalty: 0.1,
-        frequency_penalty: 0.1
+      const response = await this.client.responses.create({
+        model: 'gpt-5.1',
+        input: input
       });
 
-      const result = response.choices[0]?.message?.content;
+      const result = response.output_text;
 
       // Track usage
       if (response.usage?.total_tokens) {
         this.totalTokensUsed += response.usage.total_tokens;
-        this.totalCost += this.calculateCost(response.usage.total_tokens, 'gpt-4o-mini');
+        this.totalCost += this.calculateCost(response.usage.total_tokens, 'gpt-5.1');
 
         // Record to database - use first recent message for channel/user context
         const firstMessage = context.recentMessages[context.recentMessages.length - 1];
         await this.recordInteraction(
           'response_generation',
           response.usage.total_tokens,
-          'gpt-4o-mini',
+          'gpt-5.1',
           true,
           firstMessage?.channel,
           firstMessage?.user
@@ -520,9 +487,10 @@ ${context.relevantMemories.length > 0 ? '\nRelevant memories:\n' + context.relev
   }
 
   private calculateCost(tokens: number, model: string): number {
-    // Pricing as of 2024
+    // Pricing as of 2024-2025
     const pricing: Record<string, { input: number; output: number }> = {
-      'gpt-4o-mini': { input: 0.00015, output: 0.0006 }, // per 1k tokens
+      'gpt-4o': { input: 0.0025, output: 0.01 }, // per 1k tokens
+      'gpt-5.1': { input: 0.0025, output: 0.01 }, // per 1k tokens (estimated)
       'text-embedding-3-small': { input: 0.00002, output: 0 } // per 1k tokens
     };
 

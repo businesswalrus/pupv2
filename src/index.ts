@@ -144,12 +144,16 @@ app.message(async ({ message, say, client }) => {
       thread_ts: msg.thread_ts
     };
 
-    // Buffer this message to Redis for future context
-    try {
-      const redis = getRedisService();
-      await redis.bufferMessage(msg.channel, messageContext);
-    } catch (error) {
-      logger.debug('Redis not available for message buffering');
+    // Buffer this message to Redis for future context (only if not from bot)
+    if (msg.user !== botUserId) {
+      try {
+        const redis = getRedisService();
+        await redis.bufferMessage(msg.channel, messageContext);
+      } catch (error) {
+        logger.debug('Redis not available for message buffering');
+      }
+    } else {
+      logger.debug('Skipping buffer for bot message');
     }
 
     // Get recent messages from Redis buffer
@@ -157,8 +161,18 @@ app.message(async ({ message, say, client }) => {
     try {
       const redis = getRedisService();
       const buffered = await redis.getRecentMessages(msg.channel, 20); // Get last 20 messages
+
+      // Filter out bot's own messages to prevent response loops
+      const filteredBuffered = buffered.filter(m => m.user !== botUserId);
+
       // Prepend buffered messages (they're already in reverse chronological order)
-      recentMessages = [...buffered.slice(0, 19), messageContext];
+      recentMessages = [...filteredBuffered.slice(0, 19), messageContext];
+
+      logger.debug('Recent messages filtered', {
+        totalBuffered: buffered.length,
+        afterFiltering: filteredBuffered.length,
+        botUserId
+      });
     } catch (error) {
       logger.debug('Using only current message (Redis not available)');
     }
