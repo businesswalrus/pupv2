@@ -346,14 +346,18 @@ async function start() {
     logger.info('Initializing database...');
     await initializeDatabase();
 
-    // Initialize Redis (graceful degradation if it fails)
-    logger.info('Initializing Redis...');
-    try {
-      await initializeRedis();
-      logger.info('✓ Redis connected - message buffering and caching enabled');
-    } catch (redisError) {
-      logger.warn('Redis connection failed - running without caching layer', redisError);
-      logger.warn('Bot will function but won\'t have conversation context');
+    // Initialize Redis only if URL is provided
+    if (process.env.REDIS_URL) {
+      logger.info('Initializing Redis...');
+      try {
+        await initializeRedis();
+        logger.info('✓ Redis connected - message buffering and caching enabled');
+      } catch (redisError) {
+        logger.warn('Redis connection failed - running without caching layer', redisError);
+      }
+    } else {
+      logger.info('Redis not configured - running without message buffering');
+      logger.info('Bot will function but won\'t have conversation context');
     }
 
     // Start Slack app (Express server)
