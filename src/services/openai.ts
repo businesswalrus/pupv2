@@ -71,58 +71,49 @@ export async function generateResponse(options: ResponseOptions): Promise<string
   ];
 
   try {
-    // Use Responses API with gpt-5-mini for all requests
+    // Use Chat Completions with search model for web search, Responses API otherwise
+    if (enableWebSearch) {
+      // Chat Completions API with dedicated search model (per OpenAI docs)
+      const response = await openai.chat.completions.create({
+        model: 'gpt-4o-mini-search-preview',
+        messages: fullMessages,
+        max_tokens: maxTokens,
+      });
+
+      const content = response.choices[0]?.message?.content;
+      if (content) {
+        return content;
+      }
+
+      logger.warn('Web search returned no content', {
+        finishReason: response.choices[0]?.finish_reason,
+      });
+      return 'I couldn\'t find that information.';
+    }
+
+    // Regular requests use Responses API with gpt-5-mini
     const response = await (openai as any).responses.create({
       model: 'gpt-5-mini',
       input: fullMessages.map(m => ({ role: m.role, content: m.content })),
-      tools: enableWebSearch ? [{ type: 'web_search' }] : undefined,
       max_output_tokens: maxTokens,
     });
 
-    // Debug: log full response when web search is enabled
-    if (enableWebSearch) {
-      logger.info('Web search response structure', {
-        hasOutputText: !!response.output_text,
-        outputText: response.output_text?.substring(0, 100),
-        outputLength: response.output?.length,
-        output: JSON.stringify(response.output, null, 2).substring(0, 500),
-      });
-    }
-
-    // Extract text from response - try multiple structures
     if (response.output_text) {
       return response.output_text;
     }
 
-    // Handle various output structures (especially when tools like web_search are used)
+    // Fallback parsing for different response structures
     if (Array.isArray(response.output)) {
       for (const item of response.output) {
-        // Check message type with content array
         if (item.type === 'message' && Array.isArray(item.content)) {
           for (const contentBlock of item.content) {
-            if (contentBlock.type === 'output_text' && contentBlock.text) {
-              return contentBlock.text;
-            }
-            if (contentBlock.type === 'text' && contentBlock.text) {
+            if (contentBlock.text) {
               return contentBlock.text;
             }
           }
         }
-        // Direct text content on item
-        if (item.type === 'text' && item.text) {
-          return item.text;
-        }
       }
     }
-
-    // Log what we got for debugging
-    logger.warn('Could not extract text from response', {
-      hasOutputText: !!response.output_text,
-      hasOutput: !!response.output,
-      outputLength: response.output?.length,
-      outputTypes: response.output?.map((o: any) => o.type),
-      webSearchEnabled: enableWebSearch,
-    });
 
     return 'I couldn\'t generate a response.';
   } catch (error: any) {
