@@ -79,22 +79,59 @@ export async function generateResponse(options: ResponseOptions): Promise<string
       max_output_tokens: maxTokens,
     });
 
-    // Extract text from response
+    // Debug: log full response when web search is enabled
+    if (enableWebSearch) {
+      logger.info('Web search response structure', {
+        hasOutputText: !!response.output_text,
+        outputText: response.output_text?.substring(0, 100),
+        outputLength: response.output?.length,
+        output: JSON.stringify(response.output, null, 2).substring(0, 500),
+      });
+    }
+
+    // Extract text from response - try multiple structures
     if (response.output_text) {
       return response.output_text;
     }
 
-    const textOutput = response.output?.find(
-      (item: any) => item.type === 'message' && item.content?.[0]?.type === 'output_text'
-    );
-
-    if (textOutput?.content?.[0]?.text) {
-      return textOutput.content[0].text;
+    // Handle various output structures (especially when tools like web_search are used)
+    if (Array.isArray(response.output)) {
+      for (const item of response.output) {
+        // Check message type with content array
+        if (item.type === 'message' && Array.isArray(item.content)) {
+          for (const contentBlock of item.content) {
+            if (contentBlock.type === 'output_text' && contentBlock.text) {
+              return contentBlock.text;
+            }
+            if (contentBlock.type === 'text' && contentBlock.text) {
+              return contentBlock.text;
+            }
+          }
+        }
+        // Direct text content on item
+        if (item.type === 'text' && item.text) {
+          return item.text;
+        }
+      }
     }
 
+    // Log what we got for debugging
+    logger.warn('Could not extract text from response', {
+      hasOutputText: !!response.output_text,
+      hasOutput: !!response.output,
+      outputLength: response.output?.length,
+      outputTypes: response.output?.map((o: any) => o.type),
+      webSearchEnabled: enableWebSearch,
+    });
+
     return 'I couldn\'t generate a response.';
-  } catch (error) {
-    logger.error('Failed to generate response', { error });
+  } catch (error: any) {
+    logger.error('Failed to generate response', {
+      error: error?.message || error,
+      status: error?.status,
+      code: error?.code,
+      webSearchEnabled: enableWebSearch,
+    });
     throw error;
   }
 }
