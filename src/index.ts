@@ -85,8 +85,8 @@ app.message(async ({ message, say, client }) => {
   try {
     const msg = message as any;
 
-    // Skip messages from bots
-    if (msg.bot_id || msg.subtype === 'bot_message') {
+    // Skip messages from bots (multiple checks to be safe)
+    if (msg.bot_id || msg.subtype === 'bot_message' || msg.subtype) {
       return;
     }
 
@@ -94,10 +94,16 @@ app.message(async ({ message, say, client }) => {
     if (!botUserId) {
       const authResult = await client.auth.test();
       botUserId = authResult.user_id || null;
+      logger.info('Bot user ID resolved', { botUserId });
     }
 
     if (!botUserId) {
       logger.error('Could not determine bot user ID');
+      return;
+    }
+
+    // Skip messages from ourselves
+    if (msg.user === botUserId) {
       return;
     }
 
