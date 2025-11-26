@@ -3,7 +3,6 @@ import dotenv from 'dotenv';
 import { logger } from './utils/logger';
 import { initializeOpenAI, generateResponse, generateEmbedding, extractFacts, shouldUseWebSearch, Message } from './services/openai';
 import { initializeSupabase, ensureUser, storeFact, getUserFacts, deleteUserData, getStats } from './services/supabase';
-import { buildContext, resolveUserNames, formatMessagesForPrompt } from './services/context';
 
 // Load environment variables - only in development
 if (process.env.NODE_ENV !== 'production') {
@@ -65,6 +64,9 @@ receiver.router.get('/', (_req, res) => {
 // Store bot user ID for mention detection
 let botUserId: string | null = null;
 
+// Track processed messages to prevent duplicates (Slack can retry)
+const processedMessages = new Set<string>();
+
 // Check if message is directed at the bot (mention or DM)
 function isDirectedAtBot(text: string, channelId: string, botId: string): { directed: boolean; type: 'mention' | 'dm' | null } {
   // DM channels start with 'D'
@@ -107,6 +109,20 @@ app.message(async ({ message, say, client }) => {
       return;
     }
 
+    // Deduplicate - Slack can send the same event multiple times
+    const messageId = `${msg.channel}-${msg.ts}`;
+    if (processedMessages.has(messageId)) {
+      logger.debug('Skipping duplicate message', { messageId });
+      return;
+    }
+    processedMessages.add(messageId);
+
+    // Clean up old entries (keep last 1000)
+    if (processedMessages.size > 1000) {
+      const entries = Array.from(processedMessages);
+      entries.slice(0, 500).forEach(id => processedMessages.delete(id));
+    }
+
     // Check if this message is directed at the bot
     const { directed, type } = isDirectedAtBot(msg.text || '', msg.channel, botUserId);
 
@@ -131,38 +147,30 @@ app.message(async ({ message, say, client }) => {
       logger.warn('Failed to ensure user exists', { error });
     }
 
-    // Build conversation context
-    const context = await buildContext(
-      client,
-      msg.channel,
-      msg.thread_ts,
-      msg.text
-    );
-
-    // Resolve user names for better context
-    const userMap = await resolveUserNames(client, context.participants);
-
-    // Format recent messages
-    const formattedHistory = formatMessagesForPrompt(context.recentMessages, userMap);
-
     // Remove bot mention from the text for cleaner input
     const cleanedText = (msg.text || '').replace(new RegExp(`<@${botUserId}>`, 'g'), '').trim();
 
-    // Build messages for AI
-    const messages: Message[] = [];
+    // Skip empty messages
+    if (!cleanedText) {
+      return;
+    }
 
-    // Add conversation history as context
-    if (formattedHistory) {
-      messages.push({
-        role: 'user',
-        content: `Recent conversation:\n${formattedHistory}\n\nNow respond to: ${cleanedText}`,
-      });
-    } else {
-      messages.push({
+    // Get relevant facts about the user (not full conversation history)
+    let relevantFacts: string[] = [];
+    try {
+      const userFacts = await getUserFacts(msg.user, 5);
+      relevantFacts = userFacts.map(f => f.fact);
+    } catch (error) {
+      logger.debug('Could not fetch user facts', { error });
+    }
+
+    // Build simple message - just respond to what was said
+    const messages: Message[] = [
+      {
         role: 'user',
         content: cleanedText,
-      });
-    }
+      },
+    ];
 
     // Determine if web search is needed
     const useWebSearch = shouldUseWebSearch(cleanedText);
@@ -170,7 +178,7 @@ app.message(async ({ message, say, client }) => {
     // Generate response
     const response = await generateResponse({
       messages,
-      userFacts: context.relevantFacts,
+      userFacts: relevantFacts,
       enableWebSearch: useWebSearch,
     });
 
