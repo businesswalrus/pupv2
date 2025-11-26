@@ -71,33 +71,17 @@ export async function generateResponse(options: ResponseOptions): Promise<string
   ];
 
   try {
-    // Use Chat Completions with search model for web search, Responses API otherwise
-    if (enableWebSearch) {
-      // Chat Completions API with dedicated search model (per OpenAI docs)
-      const response = await openai.chat.completions.create({
-        model: 'gpt-4o-mini-search-preview',
-        messages: fullMessages,
-        max_tokens: maxTokens,
-      });
+    // Use gpt-5 for web search (supports web_search tool), gpt-5-mini otherwise
+    const model = enableWebSearch ? 'gpt-5' : 'gpt-5-mini';
 
-      const content = response.choices[0]?.message?.content;
-      if (content) {
-        return content;
-      }
-
-      logger.warn('Web search returned no content', {
-        finishReason: response.choices[0]?.finish_reason,
-      });
-      return 'I couldn\'t find that information.';
-    }
-
-    // Regular requests use Responses API with gpt-5-mini
     const response = await (openai as any).responses.create({
-      model: 'gpt-5-mini',
+      model,
       input: fullMessages.map(m => ({ role: m.role, content: m.content })),
+      tools: enableWebSearch ? [{ type: 'web_search' }] : undefined,
       max_output_tokens: maxTokens,
     });
 
+    // Per OpenAI docs, response.output_text contains the text
     if (response.output_text) {
       return response.output_text;
     }
@@ -114,6 +98,13 @@ export async function generateResponse(options: ResponseOptions): Promise<string
         }
       }
     }
+
+    logger.warn('Could not extract text from response', {
+      model,
+      webSearch: enableWebSearch,
+      hasOutput: !!response.output,
+      outputLength: response.output?.length,
+    });
 
     return 'I couldn\'t generate a response.';
   } catch (error: any) {
