@@ -71,41 +71,28 @@ export async function generateResponse(options: ResponseOptions): Promise<string
   ];
 
   try {
-    if (enableWebSearch) {
-      // Use responses API with web search tool
-      const response = await (openai as any).responses.create({
-        model: 'gpt-4o',
-        input: fullMessages.map(m => ({ role: m.role, content: m.content })),
-        tools: [{ type: 'web_search_preview' }],
-        max_output_tokens: maxTokens,
-      });
+    // Use Responses API with gpt-5-mini for all requests
+    const response = await (openai as any).responses.create({
+      model: 'gpt-5-mini',
+      input: fullMessages.map(m => ({ role: m.role, content: m.content })),
+      tools: enableWebSearch ? [{ type: 'web_search_preview' }] : undefined,
+      max_output_tokens: maxTokens,
+    });
 
-      // Extract text from response
-      const textOutput = response.output?.find(
-        (item: any) => item.type === 'message' && item.content?.[0]?.type === 'output_text'
-      );
-
-      if (textOutput?.content?.[0]?.text) {
-        return textOutput.content[0].text;
-      }
-
-      // Fallback to output_text if available
-      if (response.output_text) {
-        return response.output_text;
-      }
-
-      return 'I couldn\'t generate a response.';
-    } else {
-      // Standard chat completion
-      const response = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: fullMessages,
-        max_tokens: maxTokens,
-        temperature: 0.7,
-      });
-
-      return response.choices[0]?.message?.content || 'I couldn\'t generate a response.';
+    // Extract text from response
+    if (response.output_text) {
+      return response.output_text;
     }
+
+    const textOutput = response.output?.find(
+      (item: any) => item.type === 'message' && item.content?.[0]?.type === 'output_text'
+    );
+
+    if (textOutput?.content?.[0]?.text) {
+      return textOutput.content[0].text;
+    }
+
+    return 'I couldn\'t generate a response.';
   } catch (error) {
     logger.error('Failed to generate response', { error });
     throw error;
@@ -175,15 +162,14 @@ Conversation:
 ${conversationText}`;
 
   try {
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [{ role: 'user', content: prompt }],
-      max_tokens: 300,
-      temperature: 0.3,
-      response_format: { type: 'json_object' },
+    const response = await (openai as any).responses.create({
+      model: 'gpt-5-mini',
+      input: [{ role: 'user', content: prompt }],
+      max_output_tokens: 300,
+      text: { format: { type: 'json_object' } },
     });
 
-    const content = response.choices[0]?.message?.content || '{"facts":[]}';
+    const content = response.output_text || '{"facts":[]}';
     const parsed = JSON.parse(content);
     return Array.isArray(parsed.facts) ? parsed.facts : [];
   } catch (error) {
