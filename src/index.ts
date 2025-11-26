@@ -1,12 +1,9 @@
 import { App, ExpressReceiver } from '@slack/bolt';
 import dotenv from 'dotenv';
-import { initializeDatabase } from './database/connection';
 import { logger } from './utils/logger';
-import { processMessage, MessageContext } from './pipeline';
-import { getOpenAIService } from './services/openai';
-import { initializeRedis, getRedisService, shutdownRedis } from './services/redis';
-import { ensureUserExists, updateUserActivity, deleteUserData } from './services/users';
-import { allQuery, getDatabaseStats } from './database/connection';
+import { initializeOpenAI, generateResponse, generateEmbedding, extractFacts, shouldUseWebSearch, Message } from './services/openai';
+import { initializeSupabase, ensureUser, storeFact, getUserFacts, deleteUserData, getStats } from './services/supabase';
+import { buildContext, resolveUserNames, formatMessagesForPrompt } from './services/context';
 
 // Load environment variables - only in development
 if (process.env.NODE_ENV !== 'production') {
@@ -14,102 +11,81 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 // Validate required environment variables
-if (!process.env.SLACK_SIGNING_SECRET) {
-  logger.error('SLACK_SIGNING_SECRET is not set!');
-  process.exit(1);
+const requiredEnvVars = ['SLACK_SIGNING_SECRET', 'SLACK_BOT_TOKEN', 'OPENAI_API_KEY', 'SUPABASE_URL', 'SUPABASE_SERVICE_KEY'];
+for (const envVar of requiredEnvVars) {
+  if (!process.env[envVar]) {
+    logger.error(`${envVar} is not set!`);
+    process.exit(1);
+  }
 }
-
-if (!process.env.SLACK_BOT_TOKEN) {
-  logger.error('SLACK_BOT_TOKEN is not set!');
-  process.exit(1);
-}
-
 
 // Create an Express receiver for HTTP mode
 const receiver = new ExpressReceiver({
-  signingSecret: process.env.SLACK_SIGNING_SECRET,
+  signingSecret: process.env.SLACK_SIGNING_SECRET!,
   processBeforeResponse: true,
-  logLevel: process.env.LOG_LEVEL as any || 'debug',
 });
 
 // Initialize Slack app with HTTP receiver
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   receiver,
-  logLevel: process.env.LOG_LEVEL as any || 'info',
 });
 
-// Add health check endpoint to Express app
+// Add health check endpoint
 receiver.router.get('/health', async (_req, res) => {
   try {
-    // Gather comprehensive health metrics
-    const dbStats = await getDatabaseStats();
-    const openai = getOpenAIService();
-    const openaiStats = openai.getUsageStats();
-
-    let redisStatus = 'disconnected';
-    try {
-      const redis = getRedisService();
-      redisStatus = redis.isConnected() ? 'connected' : 'disconnected';
-    } catch {
-      redisStatus = 'not_initialized';
-    }
-
+    const stats = await getStats();
     res.json({
       status: 'healthy',
       timestamp: new Date().toISOString(),
-      version: '1.0.0',
-      mode: 'http',
+      version: '2.0.0',
       services: {
-        database: 'connected',
-        redis: redisStatus,
-        openai: 'connected'
+        slack: 'connected',
+        supabase: 'connected',
+        openai: 'connected',
       },
-      stats: {
-        database: dbStats,
-        openai: {
-          tokensUsed: openaiStats.totalTokensUsed,
-          cost: openaiStats.costInUSD
-        }
-      },
-      uptime: process.uptime()
+      stats,
+      uptime: process.uptime(),
     });
   } catch (error) {
     logger.error('Health check failed', error);
     res.status(500).json({
       status: 'unhealthy',
       timestamp: new Date().toISOString(),
-      error: 'Health check failed'
+      error: 'Health check failed',
     });
   }
 });
 
-// Add error handling middleware
-receiver.router.use((err: any, req: any, res: any, _next: any) => {
-  logger.error('Express error:', {
-    error: err.message,
-    stack: err.stack,
-    path: req.path,
-    method: req.method,
-  });
-  res.status(500).send('Internal Server Error');
-});
-
-
-// Add root endpoint for verification
+// Root endpoint
 receiver.router.get('/', (_req, res) => {
-  res.send('pup.ai is running! 🐕');
+  res.send('pup.ai v2 is running');
 });
 
 // Store bot user ID for mention detection
 let botUserId: string | null = null;
 
-// Message handler with AI processing
+// Check if message is directed at the bot (mention or DM)
+function isDirectedAtBot(text: string, channelId: string, botId: string): { directed: boolean; type: 'mention' | 'dm' | null } {
+  // DM channels start with 'D'
+  if (channelId.startsWith('D')) {
+    return { directed: true, type: 'dm' };
+  }
+
+  // Check for @mention
+  if (text && text.includes(`<@${botId}>`)) {
+    return { directed: true, type: 'mention' };
+  }
+
+  return { directed: false, type: null };
+}
+
+// Message handler - only responds to mentions and DMs
 app.message(async ({ message, say, client }) => {
   try {
     const msg = message as any;
-    
-    // Skip messages from bots (including ourselves)
+
+    // Skip messages from bots
     if (msg.bot_id || msg.subtype === 'bot_message') {
       return;
     }
@@ -120,88 +96,119 @@ app.message(async ({ message, say, client }) => {
       botUserId = authResult.user_id || null;
     }
 
+    if (!botUserId) {
+      logger.error('Could not determine bot user ID');
+      return;
+    }
+
+    // Check if this message is directed at the bot
+    const { directed, type } = isDirectedAtBot(msg.text || '', msg.channel, botUserId);
+
+    if (!directed) {
+      // Not directed at us - ignore
+      return;
+    }
+
     logger.info('Message received', {
       channel: msg.channel,
       user: msg.user,
-      text: msg.text,
-      fullMessage: JSON.stringify(msg)
+      type,
+      text: msg.text?.substring(0, 100),
     });
 
-    // Ensure user exists in database and update activity
+    // Ensure user exists in database
     try {
-      await ensureUserExists(msg.user);
-      await updateUserActivity(msg.user, msg.channel);
+      const userInfo = await client.users.info({ user: msg.user });
+      const displayName = userInfo.user?.profile?.display_name || userInfo.user?.name;
+      await ensureUser(msg.user, displayName);
     } catch (error) {
-      logger.warn('Failed to track user activity', error);
+      logger.warn('Failed to ensure user exists', { error });
     }
 
-    // Build message context
-    const messageContext: MessageContext = {
-      text: msg.text || '',
-      user: msg.user,
-      channel: msg.channel,
-      timestamp: msg.ts,
-      thread_ts: msg.thread_ts
-    };
+    // Build conversation context
+    const context = await buildContext(
+      client,
+      msg.channel,
+      msg.thread_ts,
+      msg.text
+    );
 
-    // Buffer this message to Redis for future context (only if not from bot)
-    if (msg.user !== botUserId) {
-      try {
-        const redis = getRedisService();
-        await redis.bufferMessage(msg.channel, messageContext);
-      } catch (error) {
-        logger.debug('Redis not available for message buffering');
-      }
+    // Resolve user names for better context
+    const userMap = await resolveUserNames(client, context.participants);
+
+    // Format recent messages
+    const formattedHistory = formatMessagesForPrompt(context.recentMessages, userMap);
+
+    // Remove bot mention from the text for cleaner input
+    const cleanedText = (msg.text || '').replace(new RegExp(`<@${botUserId}>`, 'g'), '').trim();
+
+    // Build messages for AI
+    const messages: Message[] = [];
+
+    // Add conversation history as context
+    if (formattedHistory) {
+      messages.push({
+        role: 'user',
+        content: `Recent conversation:\n${formattedHistory}\n\nNow respond to: ${cleanedText}`,
+      });
     } else {
-      logger.debug('Skipping buffer for bot message');
-    }
-
-    // Get recent messages from Redis buffer
-    let recentMessages: MessageContext[] = [messageContext]; // Always include current message
-    try {
-      const redis = getRedisService();
-      const buffered = await redis.getRecentMessages(msg.channel, 20); // Get last 20 messages
-
-      // Filter out bot's own messages to prevent response loops
-      const filteredBuffered = buffered.filter(m => m.user !== botUserId);
-
-      // Prepend buffered messages (they're already in reverse chronological order)
-      recentMessages = [...filteredBuffered.slice(0, 19), messageContext];
-
-      logger.debug('Recent messages filtered', {
-        totalBuffered: buffered.length,
-        afterFiltering: filteredBuffered.length,
-        botUserId
+      messages.push({
+        role: 'user',
+        content: cleanedText,
       });
-    } catch (error) {
-      logger.debug('Using only current message (Redis not available)');
     }
 
-    // Process message through AI pipeline
-    const result = await processMessage({
-      message: messageContext,
-      botUserId: botUserId!,
-      recentMessages
+    // Determine if web search is needed
+    const useWebSearch = shouldUseWebSearch(cleanedText);
+
+    // Generate response
+    const response = await generateResponse({
+      messages,
+      userFacts: context.relevantFacts,
+      enableWebSearch: useWebSearch,
     });
 
-    // Send response if generated
-    if (result.response) {
-      await say({
-        text: result.response,
-        thread_ts: msg.thread_ts // Respond in thread if message was in thread
-      });
-    }
+    // Send response
+    await say({
+      text: response,
+      thread_ts: msg.thread_ts, // Respond in thread if message was in thread
+    });
 
-    // Log usage stats periodically
-    const openai = getOpenAIService();
-    const stats = openai.getUsageStats();
-    if (stats.totalTokensUsed > 0 && Math.random() < 0.1) { // Log 10% of the time
-      logger.info('OpenAI usage stats', stats);
-    }
+    logger.info('Response sent', {
+      type,
+      webSearchUsed: useWebSearch,
+      responseLength: response.length,
+    });
+
+    // After responding, extract and store any new facts (async, don't block)
+    extractAndStoreFacts(cleanedText, msg.user, msg.channel).catch((error) => {
+      logger.error('Failed to extract/store facts', { error });
+    });
   } catch (error) {
     logger.error('Error handling message', error);
   }
 });
+
+// Extract facts from conversation and store them
+async function extractAndStoreFacts(text: string, userId: string, channelId: string): Promise<void> {
+  try {
+    const facts = await extractFacts(text, userId);
+
+    if (facts.length === 0) {
+      return;
+    }
+
+    // Store each fact with embedding
+    for (const fact of facts) {
+      const embedding = await generateEmbedding(fact);
+      await storeFact(userId, fact, embedding, channelId);
+    }
+
+    logger.info('Stored new facts', { userId, count: facts.length });
+  } catch (error) {
+    logger.error('Failed to extract/store facts', { error });
+  }
+}
 
 // Slash command handler
 app.command('/pup', async ({ command, ack, respond }) => {
@@ -209,146 +216,75 @@ app.command('/pup', async ({ command, ack, respond }) => {
 
   const parts = command.text.split(' ');
   const subcommand = parts[0];
-  const args = parts.slice(1);
 
   try {
     switch (subcommand) {
       case 'status':
-        const openai = getOpenAIService();
-        const stats = openai.getUsageStats();
-        const dbStats = await getDatabaseStats();
-
+        const stats = await getStats();
         await respond({
-          text: `🟢 pup.ai is online and learning!
-
-*OpenAI Usage (Current Session):*
-• Tokens: ${stats.totalTokensUsed.toLocaleString()}
-• Cost: ${stats.costInUSD}
+          text: `pup.ai v2 is online
 
 *Database:*
-• Users: ${dbStats.users}
-• Memories: ${dbStats.memories}
-• Channels Tracked: ${dbStats.channels}
-• Total Interactions: ${dbStats.interactions}`,
-          response_type: 'ephemeral'
+- Users: ${stats.users}
+- Facts stored: ${stats.facts}
+
+*Uptime:* ${Math.round(process.uptime() / 60)} minutes`,
+          response_type: 'ephemeral',
         });
         break;
 
       case 'privacy':
-        const userId = command.user_id;
-
-        // Get user profile
-        const userProfile = await allQuery(
-          'SELECT * FROM users WHERE slack_id = ?',
-          [userId]
-        );
-
-        // Get user's memories
-        const userMemories = await allQuery(
-          'SELECT content, type, created_at FROM memories WHERE user_id = ? ORDER BY created_at DESC LIMIT 10',
-          [userId]
-        );
-
-        // Get interaction stats
-        const userInteractions = await allQuery(
-          'SELECT COUNT(*) as count, SUM(cost_usd) as total_cost FROM interactions WHERE user_id = ?',
-          [userId]
-        );
-
-        if (!userProfile || userProfile.length === 0) {
-          await respond({
-            text: `I don't have any data about you yet. Start chatting and I'll learn about you over time!`,
-            response_type: 'ephemeral'
-          });
-          break;
-        }
-
-        const profile = userProfile[0];
-        const memories = userMemories.map((m: any) => `• [${m.type}] ${m.content.substring(0, 80)}...`).join('\n');
-        const interactionStats = userInteractions[0];
+        const userFacts = await getUserFacts(command.user_id);
+        const factsList = userFacts.length > 0
+          ? userFacts.map((f) => `- ${f.fact}`).join('\n')
+          : 'No facts stored about you yet.';
 
         await respond({
-          text: `*Your Privacy Report*
+          text: `*What I know about you:*
 
-*Profile:*
-• Display Name: ${profile.display_name}
-• First Seen: ${new Date(profile.created_at).toLocaleDateString()}
-• Last Seen: ${new Date(profile.last_seen).toLocaleDateString()}
-
-*Memories About You (${userMemories.length} shown):*
-${memories || 'No memories yet'}
-
-*Usage:*
-• Interactions: ${interactionStats.count || 0}
-• Estimated Cost: $${(interactionStats.total_cost || 0).toFixed(4)}
+${factsList}
 
 Use \`/pup forget me\` to delete all your data.`,
-          response_type: 'ephemeral'
+          response_type: 'ephemeral',
         });
         break;
 
       case 'forget':
-        const forgetUserId = command.user_id;
-
-        if (args[0] === 'me') {
-          // Delete all user data
-          await deleteUserData(forgetUserId);
+        if (parts[1] === 'me') {
+          await deleteUserData(command.user_id);
           await respond({
-            text: `✅ All your data has been permanently deleted. This includes:
-• Your user profile
-• All memories about you
-• All interaction records
-
-You'll be treated as a new user going forward. Thanks for using pup.ai!`,
-            response_type: 'ephemeral'
+            text: `Done. All your data has been deleted.`,
+            response_type: 'ephemeral',
           });
         } else {
           await respond({
-            text: `Use \`/pup forget me\` to delete all your data.
-
-Note: This action is permanent and cannot be undone.`,
-            response_type: 'ephemeral'
+            text: `Use \`/pup forget me\` to delete all your data. This is permanent.`,
+            response_type: 'ephemeral',
           });
         }
         break;
 
-      case 'pause':
-        // For now, just acknowledge - full implementation would need a paused_users table
-        await respond({
-          text: `Pause functionality coming soon!
-
-This will allow you to temporarily stop pup.ai from:
-• Processing your messages
-• Forming memories about you
-• Responding to you
-
-Your existing data will remain intact.`,
-          response_type: 'ephemeral'
-        });
-        break;
-
       case 'help':
-        await respond({
-          text: `*pup.ai commands:*
-• \`/pup status\` - Check system status and stats
-• \`/pup privacy\` - See what I know about you
-• \`/pup forget me\` - Delete all your data
-• \`/pup pause\` - Pause processing (coming soon)`,
-          response_type: 'ephemeral'
-        });
-        break;
-
       default:
         await respond({
-          text: "I don't know that command yet. Try `/pup help`",
-          response_type: 'ephemeral'
+          text: `*pup.ai commands:*
+- \`/pup status\` - Check system status
+- \`/pup privacy\` - See what I know about you
+- \`/pup forget me\` - Delete all your data
+- \`/pup help\` - This message
+
+*How I work:*
+- Mention me (@pup) or DM me to chat
+- I remember facts about you to be more helpful
+- I can search the web for current information`,
+          response_type: 'ephemeral',
         });
     }
   } catch (error) {
     logger.error('Error handling slash command', { command: command.text, error });
     await respond({
-      text: 'Sorry, something went wrong processing that command. The error has been logged.',
-      response_type: 'ephemeral'
+      text: 'Something went wrong. Try again later.',
+      response_type: 'ephemeral',
     });
   }
 });
@@ -356,30 +292,17 @@ Your existing data will remain intact.`,
 // Start the app
 async function start() {
   try {
-    // Initialize database
-    logger.info('Initializing database...');
-    await initializeDatabase();
+    // Initialize services
+    logger.info('Initializing services...');
+    initializeOpenAI();
+    initializeSupabase();
 
-    // Initialize Redis only if URL is provided
-    if (process.env.REDIS_URL) {
-      logger.info('Initializing Redis...');
-      try {
-        await initializeRedis();
-        logger.info('✓ Redis connected - message buffering and caching enabled');
-      } catch (redisError) {
-        logger.warn('Redis connection failed - running without caching layer', redisError);
-      }
-    } else {
-      logger.info('Redis not configured - running without message buffering');
-      logger.info('Bot will function but won\'t have conversation context');
-    }
-
-    // Start Slack app (Express server)
+    // Start Slack app
     const PORT = process.env.PORT || 3000;
     await app.start(PORT);
 
     logger.info('='.repeat(50));
-    logger.info(`⚡️ pup.ai is running on port ${PORT}!`);
+    logger.info(`pup.ai v2 is running on port ${PORT}`);
     logger.info('='.repeat(50));
   } catch (error) {
     logger.error('Failed to start app', error);
@@ -389,15 +312,7 @@ async function start() {
 
 // Graceful shutdown
 process.on('SIGTERM', async () => {
-  logger.info('SIGTERM received, shutting down gracefully...');
-
-  // Shutdown Redis connection
-  try {
-    await shutdownRedis();
-  } catch (error) {
-    logger.warn('Error shutting down Redis', error);
-  }
-
+  logger.info('SIGTERM received, shutting down...');
   await app.stop();
   process.exit(0);
 });
