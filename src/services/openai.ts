@@ -75,7 +75,7 @@ export async function generateResponse(options: ResponseOptions): Promise<string
     const response = await (openai as any).responses.create({
       model: 'gpt-5-mini',
       input: fullMessages.map(m => ({ role: m.role, content: m.content })),
-      tools: enableWebSearch ? [{ type: 'web_search_preview' }] : undefined,
+      tools: enableWebSearch ? [{ type: 'web_search' }] : undefined,
       max_output_tokens: maxTokens,
     });
 
