@@ -64,30 +64,87 @@ receiver.router.get('/', (_req, res) => {
 // Store bot user ID for mention detection
 let botUserId: string | null = null;
 
-// Track processed messages to prevent duplicates (Slack can retry)
+// Track processed messages to prevent duplicates
 const processedMessages = new Set<string>();
 
-// Check if message is directed at the bot (mention or DM)
-function isDirectedAtBot(text: string, channelId: string, botId: string): { directed: boolean; type: 'mention' | 'dm' | null } {
-  // DM channels start with 'D'
-  if (channelId.startsWith('D')) {
-    return { directed: true, type: 'dm' };
-  }
+// Track activated channels - when active, bot participates in conversation
+const activeChannels = new Set<string>();
 
-  // Check for @mention
-  if (text && text.includes(`<@${botId}>`)) {
-    return { directed: true, type: 'mention' };
-  }
+// Fetch recent channel messages for context
+async function fetchChannelHistory(client: any, channelId: string, limit = 15): Promise<string[]> {
+  try {
+    const result = await client.conversations.history({
+      channel: channelId,
+      limit,
+    });
 
-  return { directed: false, type: null };
+    if (!result.messages) return [];
+
+    // Get messages, filter bots, reverse to chronological order
+    const messages = result.messages
+      .filter((m: any) => !m.bot_id && m.text && m.user)
+      .reverse()
+      .map((m: any) => `${m.user}: ${m.text}`);
+
+    return messages;
+  } catch (error) {
+    logger.error('Failed to fetch channel history', { channelId, error });
+    return [];
+  }
 }
 
-// Message handler - only responds to mentions and DMs
+// Ask AI if we should respond to this message (when in active mode)
+async function shouldRespondOrganically(
+  recentMessages: string[],
+  currentMessage: string,
+  userFacts: string[]
+): Promise<{ shouldRespond: boolean; reason: string }> {
+  const prompt = `You are pup.ai monitoring a Slack conversation. Based on the context, decide if you should chime in.
+
+RESPOND if:
+- Someone asks a question you can help with
+- There's an opportunity for a helpful or witty comment
+- The conversation would benefit from your input
+- Someone seems stuck or confused
+
+DON'T RESPOND if:
+- People are just chatting casually and don't need input
+- The conversation is flowing fine without you
+- It would be interrupting
+- You have nothing valuable to add
+
+Recent conversation:
+${recentMessages.slice(-10).join('\n')}
+
+Latest message: ${currentMessage}
+
+${userFacts.length > 0 ? `Facts you know: ${userFacts.join(', ')}` : ''}
+
+Respond with JSON: {"shouldRespond": true/false, "reason": "brief explanation"}`;
+
+  try {
+    const response = await generateResponse({
+      messages: [{ role: 'user', content: prompt }],
+      maxTokens: 100,
+    });
+
+    const parsed = JSON.parse(response);
+    return {
+      shouldRespond: parsed.shouldRespond === true,
+      reason: parsed.reason || '',
+    };
+  } catch (error) {
+    logger.debug('Failed to determine if should respond', { error });
+    return { shouldRespond: false, reason: 'parse error' };
+  }
+}
+
+// Message handler
 app.message(async ({ message, say, client }) => {
   try {
     const msg = message as any;
 
-    // Skip messages from bots (multiple checks to be safe)
+    // Skip bot messages
     if (msg.bot_id || msg.subtype === 'bot_message' || msg.subtype) {
       return;
     }
@@ -104,41 +161,102 @@ app.message(async ({ message, say, client }) => {
       return;
     }
 
-    // Skip messages from ourselves
+    // Skip our own messages
     if (msg.user === botUserId) {
       return;
     }
 
-    // Deduplicate - Slack can send the same event multiple times
+    // Deduplicate
     const messageId = `${msg.channel}-${msg.ts}`;
     if (processedMessages.has(messageId)) {
-      logger.debug('Skipping duplicate message', { messageId });
       return;
     }
     processedMessages.add(messageId);
 
-    // Clean up old entries (keep last 1000)
+    // Cleanup old entries
     if (processedMessages.size > 1000) {
       const entries = Array.from(processedMessages);
       entries.slice(0, 500).forEach(id => processedMessages.delete(id));
     }
 
-    // Check if this message is directed at the bot
-    const { directed, type } = isDirectedAtBot(msg.text || '', msg.channel, botUserId);
+    const text = msg.text || '';
+    const textLower = text.toLowerCase().trim();
+    const isDM = msg.channel.startsWith('D');
+    const isMention = text.includes(`<@${botUserId}>`);
+    const isActive = activeChannels.has(msg.channel);
 
-    if (!directed) {
-      // Not directed at us - ignore
+    // Handle activate/deactivate commands
+    if (isMention || isDM) {
+      if (textLower.includes('activate')) {
+        activeChannels.add(msg.channel);
+        await say({
+          text: "I'm now active in this channel. I'll read along and chime in when I have something useful to add. Say \"deactivate\" to turn me off.",
+          thread_ts: msg.thread_ts,
+        });
+        logger.info('Channel activated', { channel: msg.channel });
+        return;
+      }
+
+      if (textLower.includes('deactivate')) {
+        activeChannels.delete(msg.channel);
+        await say({
+          text: "Got it, going quiet. Mention me if you need me.",
+          thread_ts: msg.thread_ts,
+        });
+        logger.info('Channel deactivated', { channel: msg.channel });
+        return;
+      }
+    }
+
+    // Determine if we should respond
+    let shouldRespond = false;
+    let responseType: 'mention' | 'dm' | 'organic' = 'organic';
+
+    if (isDM) {
+      shouldRespond = true;
+      responseType = 'dm';
+    } else if (isMention) {
+      shouldRespond = true;
+      responseType = 'mention';
+    } else if (isActive) {
+      // In active mode - check if we should respond organically
+      // Don't respond to every message, use judgment
+      responseType = 'organic';
+    } else {
+      // Not active and not mentioned - ignore
       return;
     }
 
-    logger.info('Message received', {
-      channel: msg.channel,
-      user: msg.user,
-      type,
-      text: msg.text?.substring(0, 100),
-    });
+    // Get user facts
+    let userFacts: string[] = [];
+    try {
+      const facts = await getUserFacts(msg.user, 5);
+      userFacts = facts.map(f => f.fact);
+    } catch (error) {
+      logger.debug('Could not fetch user facts', { error });
+    }
 
-    // Ensure user exists in database
+    // Get channel history for context
+    let recentMessages: string[] = [];
+    if (isActive || isMention) {
+      recentMessages = await fetchChannelHistory(client, msg.channel, 15);
+    }
+
+    // If in organic mode, ask AI if we should respond
+    if (responseType === 'organic' && isActive) {
+      const decision = await shouldRespondOrganically(recentMessages, text, userFacts);
+      if (!decision.shouldRespond) {
+        logger.debug('Decided not to respond organically', { reason: decision.reason });
+        return;
+      }
+      shouldRespond = true;
+    }
+
+    if (!shouldRespond) {
+      return;
+    }
+
+    // Ensure user exists
     try {
       const userInfo = await client.users.info({ user: msg.user });
       const displayName = userInfo.user?.profile?.display_name || userInfo.user?.name;
@@ -147,72 +265,69 @@ app.message(async ({ message, say, client }) => {
       logger.warn('Failed to ensure user exists', { error });
     }
 
-    // Remove bot mention from the text for cleaner input
-    const cleanedText = (msg.text || '').replace(new RegExp(`<@${botUserId}>`, 'g'), '').trim();
+    // Clean the text
+    const cleanedText = text.replace(new RegExp(`<@${botUserId}>`, 'g'), '').trim();
 
-    // Skip empty messages
-    if (!cleanedText) {
+    if (!cleanedText && !isActive) {
       return;
     }
 
-    // Get relevant facts about the user (not full conversation history)
-    let relevantFacts: string[] = [];
-    try {
-      const userFacts = await getUserFacts(msg.user, 5);
-      relevantFacts = userFacts.map(f => f.fact);
-    } catch (error) {
-      logger.debug('Could not fetch user facts', { error });
+    logger.info('Processing message', {
+      channel: msg.channel,
+      user: msg.user,
+      type: responseType,
+      isActive,
+    });
+
+    // Build prompt with context
+    let promptContent: string;
+    if (recentMessages.length > 0) {
+      promptContent = `Recent conversation:\n${recentMessages.join('\n')}\n\nRespond to the latest message: ${cleanedText || '(they just mentioned you)'}`;
+    } else {
+      promptContent = cleanedText || 'Hello';
     }
 
-    // Build simple message - just respond to what was said
-    const messages: Message[] = [
-      {
-        role: 'user',
-        content: cleanedText,
-      },
-    ];
+    const messages: Message[] = [{ role: 'user', content: promptContent }];
 
-    // Determine if web search is needed
+    // Check for web search
     const useWebSearch = shouldUseWebSearch(cleanedText);
 
     // Generate response
     const response = await generateResponse({
       messages,
-      userFacts: relevantFacts,
+      userFacts,
       enableWebSearch: useWebSearch,
     });
 
     // Send response
     await say({
       text: response,
-      thread_ts: msg.thread_ts, // Respond in thread if message was in thread
+      thread_ts: msg.thread_ts,
     });
 
     logger.info('Response sent', {
-      type,
+      type: responseType,
       webSearchUsed: useWebSearch,
       responseLength: response.length,
     });
 
-    // After responding, extract and store any new facts (async, don't block)
-    extractAndStoreFacts(cleanedText, msg.user, msg.channel).catch((error) => {
-      logger.error('Failed to extract/store facts', { error });
-    });
+    // Extract facts in background
+    if (cleanedText) {
+      extractAndStoreFacts(cleanedText, msg.user, msg.channel).catch((error) => {
+        logger.error('Failed to extract/store facts', { error });
+      });
+    }
   } catch (error) {
     logger.error('Error handling message', error);
   }
 });
 
-// Extract facts from conversation and store them
+// Extract and store facts
 async function extractAndStoreFacts(text: string, userId: string, channelId: string): Promise<void> {
   try {
     const facts = await extractFacts(text, userId);
+    if (facts.length === 0) return;
 
-    if (facts.length === 0) {
-      return;
-    }
-
-    // Store each fact with embedding
     for (const fact of facts) {
       const embedding = await generateEmbedding(fact);
       await storeFact(userId, fact, embedding, channelId);
@@ -235,6 +350,7 @@ app.command('/pup', async ({ command, ack, respond }) => {
     switch (subcommand) {
       case 'status':
         const stats = await getStats();
+        const activeCount = activeChannels.size;
         await respond({
           text: `pup.ai v2 is online
 
@@ -242,6 +358,7 @@ app.command('/pup', async ({ command, ack, respond }) => {
 - Users: ${stats.users}
 - Facts stored: ${stats.facts}
 
+*Active channels:* ${activeCount}
 *Uptime:* ${Math.round(process.uptime() / 60)} minutes`,
           response_type: 'ephemeral',
         });
@@ -285,10 +402,14 @@ Use \`/pup forget me\` to delete all your data.`,
 - \`/pup status\` - Check system status
 - \`/pup privacy\` - See what I know about you
 - \`/pup forget me\` - Delete all your data
-- \`/pup help\` - This message
+
+*Activation:*
+- Say "activate" to make me active in a channel (I'll participate in conversations)
+- Say "deactivate" to make me go quiet (mention-only mode)
 
 *How I work:*
-- Mention me (@pup) or DM me to chat
+- When active: I read the conversation and chime in when helpful
+- When inactive: I only respond to @mentions and DMs
 - I remember facts about you to be more helpful
 - I can search the web for current information`,
           response_type: 'ephemeral',
@@ -306,12 +427,10 @@ Use \`/pup forget me\` to delete all your data.`,
 // Start the app
 async function start() {
   try {
-    // Initialize services
     logger.info('Initializing services...');
     initializeOpenAI();
     initializeSupabase();
 
-    // Start Slack app
     const PORT = process.env.PORT || 3000;
     await app.start(PORT);
 
